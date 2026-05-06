@@ -245,3 +245,59 @@ def copy_relative_images(
         result = result.replace(match.group(0), new_ref, 1)
 
     return result
+
+
+def _rewrite_image_paths(markdown: str, doc_name: str) -> str:
+    """Rewrite pymupdf4llm image paths to wiki convention.
+
+    pymupdf4llm outputs: ![image](filename.png) or ![image](path/filename.png)
+    Wiki needs: ![image](sources/images/{doc_name}/filename.png)
+    """
+    pattern = r'!\[([^\]]*)\]\((?!https?://|data:|/)([^)]+)\)'
+
+    def replacer(match: re.Match) -> str:
+        alt, path = match.group(1), match.group(2)
+        filename = Path(path).name
+        return f'![{alt}](sources/images/{doc_name}/{filename})'
+
+    return re.sub(pattern, replacer, markdown)
+
+
+def convert_pdf_with_pymupdf4llm(
+    pdf_path: Path,
+    doc_name: str,
+    images_dir: Path,
+    pages: list[int] | None = None,
+) -> str:
+    """Convert PDF to markdown using pymupdf4llm.
+
+    Handles tables (markdown format), multi-column layouts, and images.
+    Returns full markdown string with wiki-compatible image paths.
+
+    Args:
+        pdf_path: Path to source PDF file.
+        doc_name: Document name for image path generation.
+        images_dir: Directory to save extracted images.
+        pages: Optional list of 0-indexed page numbers to convert.
+    """
+    import pymupdf4llm
+
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    chunks = pymupdf4llm.to_markdown(
+        str(pdf_path),
+        pages=pages,
+        write_images=True,
+        image_path=str(images_dir),
+        page_chunks=True,
+        dpi=150,
+    )
+
+    parts = []
+    for chunk in chunks:
+        text = chunk.get("text", "")
+        text = _rewrite_image_paths(text, doc_name)
+        if text.strip():
+            parts.append(text)
+
+    return "\n\n".join(parts)

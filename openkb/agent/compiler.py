@@ -88,8 +88,13 @@ Write the concept page for: {title}
 This concept relates to the document "{doc_name}" summarized above.
 {update_instruction}
 
-Return a JSON object with two keys:
+Include a "## Sources & Perspectives" section at the end listing each source \
+with page/chapter references and a 1-2 sentence summary of that source's view.
+{citation_context}
+
+Return a JSON object with three keys:
 - "brief": A single sentence (under 100 chars) defining this concept
+- "citations": Array of objects with keys: book, pages (string), chapter, perspective
 - "content": The full concept page in Markdown. Include clear explanation, \
 key details from the source document, and [[wikilinks]] to related concepts \
 and [[summaries/{doc_name}]]
@@ -105,11 +110,17 @@ Current content of this page:
 
 New information from document "{doc_name}" (summarized above) should be \
 integrated into this page. Rewrite the full page incorporating the new \
-information naturally — do not just append. Maintain existing \
-[[wikilinks]] and add new ones where appropriate.
+information naturally — do not just append.
 
-Return a JSON object with two keys:
+Citation rules:
+1. Preserve ALL existing citations in "## Sources & Perspectives"
+2. ADD a new citation for "{doc_name}" with page/chapter references
+3. If the new source conflicts with existing ones, add a note callout
+4. Maintain existing [[wikilinks]] and add new ones where appropriate
+
+Return a JSON object with three keys:
 - "brief": A single sentence (under 100 chars) defining this concept (may differ from before)
+- "citations": Complete array of citation objects (existing + new), each with: book, pages, chapter, perspective
 - "content": The rewritten full concept page in Markdown
 
 Return ONLY valid JSON, no fences.
@@ -364,7 +375,7 @@ def _sanitize_concept_name(name: str) -> str:
     return sanitized or "unnamed-concept"
 
 
-def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is_update: bool, brief: str = "") -> None:
+def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is_update: bool, brief: str = "", citations: list | None = None) -> None:
     """Write or update a concept page, managing the sources frontmatter."""
     concepts_dir = wiki_dir / "concepts"
     concepts_dir.mkdir(parents=True, exist_ok=True)
@@ -414,6 +425,10 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
                 else:
                     fm = fm.replace("---\n", f"---\nbrief: {brief}\n", 1)
                 existing = fm + body
+        # Update citations in frontmatter
+        if citations and existing.startswith("---"):
+            existing = _update_frontmatter_field(existing, path, "citations", json.dumps(citations, ensure_ascii=False))
+            return
         path.write_text(existing, encoding="utf-8")
     else:
         if content.startswith("---"):
@@ -423,8 +438,28 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
         fm_lines = [f"sources: [{source_file}]"]
         if brief:
             fm_lines.append(f"brief: {brief}")
+        if citations:
+            fm_lines.append(f"citations: {json.dumps(citations, ensure_ascii=False)}")
         frontmatter = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
         path.write_text(frontmatter + content, encoding="utf-8")
+
+
+def _update_frontmatter_field(text: str, path: Path, field: str, value: str) -> str:
+    """Insert or replace a field in YAML frontmatter. Returns updated text."""
+    if not text.startswith("---"):
+        return text
+    end = text.find("---", 3)
+    if end == -1:
+        return text
+    fm = text[:end + 3]
+    body = text[end + 3:]
+    if f"{field}:" in fm:
+        fm = re.sub(rf'{field}:.*', f'{field}: {value}', fm)
+    else:
+        fm = fm.replace("---\n", f"---\n{field}: {value}\n", 1)
+    result = fm + body
+    path.write_text(result, encoding="utf-8")
+    return result
 
 
 def _add_related_link(wiki_dir: Path, concept_slug: str, doc_name: str, source_file: str) -> None:
@@ -576,6 +611,7 @@ async def _compile_concepts(
     max_concurrency: int,
     doc_brief: str = "",
     doc_type: str = "short",
+    citation_context: str = "",
 ) -> None:
     """Shared Steps 2-4: concepts plan → generate/update → index.
 
@@ -625,7 +661,7 @@ async def _compile_concepts(
     # --- Step 3: Generate/update concept pages concurrently (A cached) ---
     semaphore = asyncio.Semaphore(max_concurrency)
 
-    async def _gen_create(concept: dict) -> tuple[str, str, bool, str]:
+    async def _gen_create(concept: dict) -> tuple[str, str, bool, str, list]:
         name = concept["name"]
         title = concept.get("title", name)
         async with semaphore:
@@ -636,17 +672,19 @@ async def _compile_concepts(
                 {"role": "user", "content": _CONCEPT_PAGE_USER.format(
                     title=title, doc_name=doc_name,
                     update_instruction="",
+                    citation_context=citation_context,
                 )},
             ], f"concept: {name}")
         try:
             parsed = _parse_json(raw)
             brief = parsed.get("brief", "")
             content = parsed.get("content", raw)
+            citations = parsed.get("citations", []) if isinstance(parsed, dict) else []
         except (json.JSONDecodeError, ValueError):
-            brief, content = "", raw
-        return name, content, False, brief
+            brief, content, citations = "", raw, []
+        return name, content, False, brief, citations
 
-    async def _gen_update(concept: dict) -> tuple[str, str, bool, str]:
+    async def _gen_update(concept: dict) -> tuple[str, str, bool, str, list]:
         name = concept["name"]
         title = concept.get("title", name)
         concept_path = wiki_dir / "concepts" / f"{_sanitize_concept_name(name)}.md"
@@ -673,9 +711,10 @@ async def _compile_concepts(
             parsed = _parse_json(raw)
             brief = parsed.get("brief", "")
             content = parsed.get("content", raw)
+            citations = parsed.get("citations", []) if isinstance(parsed, dict) else []
         except (json.JSONDecodeError, ValueError):
-            brief, content = "", raw
-        return name, content, True, brief
+            brief, content, citations = "", raw, []
+        return name, content, True, brief, citations
 
     tasks = []
     tasks.extend(_gen_create(c) for c in create_items)
@@ -695,8 +734,8 @@ async def _compile_concepts(
             if isinstance(r, Exception):
                 logger.warning("Concept generation failed: %s", r)
                 continue
-            name, page_content, is_update, brief = r
-            _write_concept(wiki_dir, name, page_content, source_file, is_update, brief=brief)
+            name, page_content, is_update, brief, citations = r
+            _write_concept(wiki_dir, name, page_content, source_file, is_update, brief=brief, citations=citations)
             safe_name = _sanitize_concept_name(name)
             concept_names.append(safe_name)
             if brief:

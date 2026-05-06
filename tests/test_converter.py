@@ -81,14 +81,14 @@ class TestConvertDocumentMarkdown:
 
 
 class TestConvertDocumentPdfShort:
-    def test_short_pdf_converted_via_pymupdf(self, kb_dir, tmp_path):
-        """PDF under threshold is converted with pymupdf (convert_pdf_with_images)."""
+    def test_short_pdf_converted_via_pymupdf4llm(self, kb_dir, tmp_path):
+        """PDF under threshold is converted via pymupdf4llm (default engine)."""
         src = tmp_path / "short.pdf"
         src.write_bytes(b"%PDF-1.4 fake content")
 
         with (
             patch("openkb.converter.pymupdf.open") as mock_mu,
-            patch("openkb.converter.convert_pdf_with_images", return_value="# Short PDF\n\nConverted.") as mock_cpwi,
+            patch("openkb.images.convert_pdf_with_pymupdf4llm", return_value="# Short PDF\n\nConverted.") as mock_cp4,
         ):
             fake_doc = MagicMock()
             fake_doc.page_count = 5  # below default threshold of 20
@@ -98,11 +98,35 @@ class TestConvertDocumentPdfShort:
 
             result = convert_document(src, kb_dir)
 
-        mock_cpwi.assert_called_once()
+        mock_cp4.assert_called_once()
         assert result.skipped is False
         assert result.is_long_doc is False
         assert result.source_path is not None
         assert result.source_path.exists()
+
+    def test_short_pdf_legacy_engine(self, kb_dir, tmp_path):
+        """PDF with pdf_engine=legacy uses convert_pdf_with_images."""
+        src = tmp_path / "short.pdf"
+        src.write_bytes(b"%PDF-1.4 fake content")
+
+        config_dir = kb_dir / ".openkb"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "config.yaml").write_text("pdf_engine: legacy\n")
+
+        with (
+            patch("openkb.converter.pymupdf.open") as mock_mu,
+            patch("openkb.converter.convert_pdf_with_images", return_value="# Short PDF\n\nConverted.") as mock_cpwi,
+        ):
+            fake_doc = MagicMock()
+            fake_doc.page_count = 5
+            fake_doc.__enter__ = MagicMock(return_value=fake_doc)
+            fake_doc.__exit__ = MagicMock(return_value=False)
+            mock_mu.return_value = fake_doc
+
+            result = convert_document(src, kb_dir)
+
+        mock_cpwi.assert_called_once()
+        assert result.source_path is not None
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +151,31 @@ class TestConvertDocumentPdfLong:
 
             result = convert_document(src, kb_dir)
 
-        assert result.is_long_doc is True
+        assert result.is_large_pdf is True
+        assert result.is_long_doc is False
         assert result.source_path is None
         assert result.skipped is False
         assert result.raw_path is not None
+
+    def test_long_pdf_fallback_to_pageindex(self, tmp_path, kb_dir):
+        """When split_large_pdfs=False, large PDFs use PageIndex path."""
+        src = tmp_path / "long.pdf"
+        src.write_bytes(b"%PDF-1.4 fake long content")
+
+        config_dir = kb_dir / ".openkb"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "config.yaml").write_text("split_large_pdfs: false\n")
+
+        with (
+            patch("openkb.converter.pymupdf.open") as mock_mu,
+        ):
+            fake_doc = MagicMock()
+            fake_doc.page_count = 200
+            fake_doc.__enter__ = MagicMock(return_value=fake_doc)
+            fake_doc.__exit__ = MagicMock(return_value=False)
+            mock_mu.return_value = fake_doc
+
+            result = convert_document(src, kb_dir)
+
+        assert result.is_long_doc is True
+        assert result.is_large_pdf is False

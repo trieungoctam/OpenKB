@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import logging
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Any
 from pathlib import Path
 
 import pymupdf
@@ -23,6 +24,7 @@ class ConvertResult:
     raw_path: Path | None = None
     source_path: Path | None = None
     is_long_doc: bool = False
+    is_large_pdf: bool = False
     skipped: bool = False
     file_hash: str | None = None  # For deferred hash registration
 
@@ -70,11 +72,21 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
         shutil.copy2(src, raw_dest)
 
     # ------------------------------------------------------------------
-    # 3. PDF long-doc detection
+    # 3. PDF long-doc / large-pdf detection
     # ------------------------------------------------------------------
     if src.suffix.lower() == ".pdf":
         page_count = get_pdf_page_count(src)
         if page_count >= threshold:
+            # Check if splitting is enabled for large PDFs
+            if config.get("split_large_pdfs", True):
+                logger.info(
+                    "Large PDF detected (%d pages): %s — will split into segments",
+                    page_count,
+                    src.name,
+                )
+                return ConvertResult(
+                    raw_path=raw_dest, is_large_pdf=True, file_hash=file_hash,
+                )
             logger.info(
                 "Long PDF detected (%d pages >= %d threshold): %s",
                 page_count,
@@ -97,8 +109,12 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
         markdown = src.read_text(encoding="utf-8")
         markdown = copy_relative_images(markdown, src.parent, doc_name, images_dir)
     elif src.suffix.lower() == ".pdf":
-        # Use pymupdf dict-mode for PDFs: text + images inline at correct positions
-        markdown = convert_pdf_with_images(src, doc_name, images_dir)
+        pdf_engine = config.get("pdf_engine", "pymupdf4llm")
+        if pdf_engine == "pymupdf4llm":
+            from openkb.images import convert_pdf_with_pymupdf4llm
+            markdown = convert_pdf_with_pymupdf4llm(src, doc_name, images_dir)
+        else:
+            markdown = convert_pdf_with_images(src, doc_name, images_dir)
     else:
         # Non-PDF, non-MD: use markitdown (docx, pptx, html, etc.)
         mid = MarkItDown()
@@ -106,7 +122,72 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
         markdown = result.text_content
         markdown = extract_base64_images(markdown, doc_name, images_dir)
 
+    # Describe images via VLM if enabled
+    if config.get("describe_images", True):
+        from openkb.image_describer import describe_images
+
+        vision_model = config.get("vision_model") or config.get("model", "gpt-4o-mini")
+        max_images = config.get("max_describe_images", 50)
+        markdown = describe_images(markdown, kb_dir, vision_model, max_images=max_images)
+
     dest_md = sources_dir / f"{doc_name}.md"
     dest_md.write_text(markdown, encoding="utf-8")
 
     return ConvertResult(raw_path=raw_dest, source_path=dest_md, file_hash=file_hash)
+
+
+def convert_segment(
+    segment: Any,
+    doc_name: str,
+    kb_dir: Path,
+    config: dict[str, Any] | None = None,
+) -> Path:
+    """Convert a single PDF segment to markdown and append to source file.
+
+    Args:
+        segment: PDFSegment dataclass instance (from splitter module).
+        doc_name: Parent document name (e.g. "my-book").
+        kb_dir: Knowledge base root directory.
+        config: Optional pre-loaded config dict. Loaded from disk if None.
+
+    Returns:
+        Path to the written source markdown file.
+    """
+    from openkb.splitter import PDFSegment  # noqa: F401
+    sources_dir = kb_dir / "wiki" / "sources"
+    images_dir = sources_dir / "images" / doc_name
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    seg_path = segment.path
+    start_page = segment.start_page
+    end_page = segment.end_page
+    chapter_title = segment.chapter_title
+
+    # Convert segment PDF to markdown
+    markdown = convert_pdf_with_images(seg_path, doc_name, images_dir)
+
+    # Describe images via VLM if enabled
+    seg_config = config or load_config(kb_dir / ".openkb" / "config.yaml")
+    if seg_config.get("describe_images", True):
+        from openkb.image_describer import describe_images
+
+        vision_model = seg_config.get("vision_model") or seg_config.get("model", "gpt-4o-mini")
+        max_images = seg_config.get("max_describe_images", 50)
+        markdown = describe_images(markdown, kb_dir, vision_model, max_images=max_images)
+
+    # Prepend segment metadata header
+    header = (
+        f"<!-- segment: pages {start_page}-{end_page} -->\n"
+        f"## {chapter_title} (pages {start_page}–{end_page})\n\n"
+    )
+    markdown = header + markdown
+
+    # Append to parent document's source file
+    dest_md = sources_dir / f"{doc_name}.md"
+    if dest_md.exists():
+        existing = dest_md.read_text(encoding="utf-8")
+        dest_md.write_text(existing + "\n\n---\n\n" + markdown, encoding="utf-8")
+    else:
+        dest_md.write_text(markdown, encoding="utf-8")
+
+    return dest_md

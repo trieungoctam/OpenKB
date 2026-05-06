@@ -5,10 +5,16 @@ Checks for:
 - Orphaned pages — pages with no incoming or outgoing links
 - Missing wiki entries — raw files without corresponding sources/summaries
 - Index sync — index.md links vs actual files on disk
+- Citation coverage — concepts missing structured citations
+- Source diversity — concepts with few sources
+- Concept cluster isolation — groups not linked to broader wiki
+- Book coverage — documents without concept links
 """
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 # Matches [[wikilink]] or [[subdir/link]]
@@ -16,6 +22,55 @@ _WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
 # Files to exclude from lint scanning (schema, logs, etc.)
 _EXCLUDED_FILES = {"AGENTS.md", "SCHEMA.md", "log.md"}
+
+
+class Severity(Enum):
+    CRITICAL = "critical"
+    WARNING = "warning"
+    INFO = "info"
+
+
+@dataclass
+class LintIssue:
+    severity: Severity
+    category: str
+    title: str
+    detail: str
+    location: str
+    action: str
+    sources: list[str] = field(default_factory=list)
+
+
+def _parse_frontmatter_list(text: str, key: str) -> list[str]:
+    """Parse a list value from YAML frontmatter (bracket or YAML list format)."""
+    if not text.startswith("---"):
+        return []
+    end = text.find("---", 3)
+    if end == -1:
+        return []
+    fm = text[3:end]
+    bracket_match = re.search(rf'{key}:\s*\[(.*?)\]', fm)
+    if bracket_match:
+        items = bracket_match.group(1)
+        return [i.strip().strip("'\"") for i in items.split(",") if i.strip()]
+    lines = fm.split("\n")
+    result = []
+    in_list = False
+    for line in lines:
+        if line.strip().startswith(f"{key}:"):
+            in_list = True
+            after_colon = line.split(":", 1)[1].strip()
+            if after_colon and after_colon != "[]":
+                return [after_colon.strip("'\"")]
+            continue
+        if in_list:
+            if line.strip().startswith("- "):
+                result.append(line.strip()[2:].strip("'\""))
+            elif line.startswith("  ") or line.strip() == "":
+                continue
+            else:
+                break
+    return result
 
 
 def _read_md(path: Path) -> str:
@@ -207,6 +262,168 @@ def check_index_sync(wiki: Path) -> list[str]:
     return sorted(issues)
 
 
+def check_citation_coverage(wiki: Path) -> list[str]:
+    """Check that concept pages with sources have proper citations.
+
+    Args:
+        wiki: Path to the wiki root directory.
+
+    Returns:
+        List of citation coverage issues.
+    """
+    concepts_dir = wiki / "concepts"
+    if not concepts_dir.exists():
+        return []
+
+    issues: list[str] = []
+    for md in concepts_dir.glob("*.md"):
+        text = _read_md(md)
+        has_sources = "sources:" in text
+        has_citations = "citations:" in text
+        has_section = "## Sources & Perspectives" in text
+
+        if has_sources and not has_citations:
+            issues.append(f"{md.stem}: has sources but no structured citations")
+        if has_sources and not has_section:
+            issues.append(f"{md.stem}: missing 'Sources & Perspectives' section")
+
+    return sorted(issues)
+
+
+def check_source_diversity(wiki: Path, min_sources: int = 2) -> list[LintIssue]:
+    """Check that concepts have multiple sources for cross-book synthesis."""
+    concepts_dir = wiki / "concepts"
+    if not concepts_dir.exists():
+        return []
+
+    issues: list[LintIssue] = []
+    for md in sorted(concepts_dir.glob("*.md")):
+        text = _read_md(md)
+        sources = _parse_frontmatter_list(text, "sources")
+        if len(sources) < min_sources:
+            issues.append(LintIssue(
+                severity=Severity.WARNING,
+                category="coverage",
+                title=f"Low source coverage: {md.stem}",
+                detail=f"Concept has {len(sources)} source(s), recommended ≥{min_sources}.",
+                location=f"concepts/{md.name}",
+                action="Add documents covering this topic for multiple perspectives.",
+                sources=sources,
+            ))
+    return issues
+
+
+def check_concept_clusters(wiki: Path) -> list[LintIssue]:
+    """Find isolated clusters of concepts not linked to the broader wiki."""
+    concepts_dir = wiki / "concepts"
+    if not concepts_dir.exists():
+        return []
+
+    all_concepts: set[str] = set()
+    internal_links: dict[str, set[str]] = {}
+    external_links: dict[str, set[str]] = {}
+
+    for md in concepts_dir.glob("*.md"):
+        slug = md.stem
+        all_concepts.add(slug)
+        text = _read_md(md)
+        links = set(_extract_wikilinks(text))
+        internal_links[slug] = {l for l in links if l.startswith("concepts/")}
+        external_links[slug] = {l for l in links if not l.startswith("concepts/")}
+
+    visited: set[str] = set()
+    clusters: list[set[str]] = []
+    for concept in all_concepts:
+        if concept in visited:
+            continue
+        cluster: set[str] = set()
+        queue = [concept]
+        while queue:
+            node = queue.pop(0)
+            if node in visited:
+                continue
+            visited.add(node)
+            cluster.add(node)
+            for linked in internal_links.get(node, set()):
+                linked_slug = linked.replace("concepts/", "")
+                if linked_slug in all_concepts:
+                    queue.append(linked_slug)
+        clusters.append(cluster)
+
+    issues: list[LintIssue] = []
+    for cluster in clusters:
+        has_external = any(external_links.get(c, set()) for c in cluster)
+        if not has_external and len(cluster) > 1:
+            names = [f"[[concepts/{c}]]" for c in sorted(cluster)]
+            issues.append(LintIssue(
+                severity=Severity.INFO,
+                category="isolation",
+                title=f"Isolated concept cluster ({len(cluster)} concepts)",
+                detail="Concepts only link to each other, not to summaries or other pages.",
+                location=", ".join(names[:5]),
+                action="Add cross-links to related summaries and concepts outside this cluster.",
+            ))
+    return issues
+
+
+def check_book_coverage(wiki: Path) -> list[LintIssue]:
+    """Check that document summaries link out to concept pages."""
+    summaries_dir = wiki / "summaries"
+    if not summaries_dir.exists():
+        return []
+
+    issues: list[LintIssue] = []
+    for md in sorted(summaries_dir.glob("*.md")):
+        text = _read_md(md)
+        links = _extract_wikilinks(text)
+        concept_links = [l for l in links if l.startswith("concepts/")]
+        if not concept_links:
+            issues.append(LintIssue(
+                severity=Severity.WARNING,
+                category="coverage",
+                title=f"No concept links from summary: {md.stem}",
+                detail="Document summary has no outgoing concept wikilinks.",
+                location=f"summaries/{md.name}",
+                action="Compile this document to generate concept pages.",
+            ))
+    return issues
+
+
+def format_severity_report(issues: list[LintIssue], structural: str, semantic: str) -> str:
+    """Format all lint results into severity-ordered markdown report."""
+    critical = [i for i in issues if i.severity == Severity.CRITICAL]
+    warnings = [i for i in issues if i.severity == Severity.WARNING]
+    info = [i for i in issues if i.severity == Severity.INFO]
+
+    lines = [
+        "## Summary\n",
+        f"| Severity | Count |",
+        f"|----------|-------|",
+        f"| Critical | {len(critical)} |",
+        f"| Warning | {len(warnings)} |",
+        f"| Info | {len(info)} |\n",
+    ]
+
+    if critical:
+        lines.append("## Critical Issues\n")
+        for issue in critical:
+            lines.append(f"- **{issue.title}** ({issue.location}): {issue.detail}")
+
+    if warnings:
+        lines.append("\n## Warnings\n")
+        for issue in warnings:
+            lines.append(f"- **{issue.title}** ({issue.location}): {issue.detail}")
+
+    if info:
+        lines.append("\n## Info\n")
+        for issue in info:
+            lines.append(f"- **{issue.title}** ({issue.location}): {issue.detail}")
+
+    lines.append(f"\n{structural}")
+    lines.append(f"\n{semantic}")
+    return "\n".join(lines)
+
+
 def run_structural_lint(kb_dir: Path) -> str:
     """Run all structural lint checks and return a formatted Markdown report.
 
@@ -223,6 +440,7 @@ def run_structural_lint(kb_dir: Path) -> str:
     orphans = find_orphans(wiki)
     missing = find_missing_entries(raw, wiki)
     sync_issues = check_index_sync(wiki)
+    citation_issues = check_citation_coverage(wiki)
 
     lines = ["## Structural Lint Report\n"]
 
@@ -260,5 +478,14 @@ def run_structural_lint(kb_dir: Path) -> str:
             lines.append(f"- {issue}")
     else:
         lines.append("Index is in sync.")
+    lines.append("")
+
+    # Citation coverage
+    lines.append(f"### Citation Coverage ({len(citation_issues)})")
+    if citation_issues:
+        for issue in citation_issues:
+            lines.append(f"- {issue}")
+    else:
+        lines.append("All concepts have proper citations.")
 
     return "\n".join(lines)

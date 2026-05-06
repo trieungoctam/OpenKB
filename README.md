@@ -25,12 +25,15 @@ Traditional RAG rediscovers knowledge from scratch on every query. Nothing accum
 ### Features
 
 - **Broad format support** — PDF, Word, Markdown, PowerPoint, HTML, Excel, text, and more via markitdown
-- **Scale to long documents** — Long and complex documents are handled via [PageIndex](https://github.com/VectifyAI/PageIndex) tree indexing, enabling accurate, vectorless long-context retrieval
+- **Scale to long documents** — Long PDFs automatically split by TOC/chapters with parallel compilation, enabling accurate processing of books and reports
+- **Enhanced PDF processing** — Native table extraction, multi-column layout handling, and image preservation via pymupdf4llm
+- **Cross-document citations** — Automatic source tracking (book, pages, chapter, perspective) enables verifiable knowledge
 - **Native multi-modality** — Retrieves and understands figures, tables, and images, not just text
 - **Compiled Wiki** — LLM manages and compiles your documents into summaries, concept pages, and cross-links, all kept in sync
-- **Query** — Ask questions (one-off) against your wiki. The LLM navigates your compiled knowledge to answer
+- **Smart deduplication** — Automatically merges duplicate concepts from document segments and across different documents
+- **Query** — Ask questions (one-off) against your wiki. The LLM navigates your compiled knowledge to answer with source citations
 - **Interactive Chat** — Multi-turn conversations with persisted sessions you can resume across runs
-- **Lint** — Health checks find contradictions, gaps, orphans, and stale content
+- **Lint** — Health checks with severity levels (CRITICAL/WARNING/INFO) find contradictions, gaps, orphans, and stale content
 - **Watch mode** — Drop files into `raw/`, wiki updates automatically
 - **Obsidian compatible** — Wiki is plain `.md` files with `[[wikilinks]]`. Open in Obsidian for graph view and browsing
 
@@ -121,25 +124,30 @@ wiki/
 
 ### Short vs. Long Document Handling
 
-| | Short documents | Long documents (PDF ≥ 20 pages) |
+| | Short documents | Large PDFs (≥ 20 pages) |
 |---|---|---|
-| **Convert** | markitdown → Markdown | PageIndex → tree index + summaries |
-| **Images** | Extracted inline (pymupdf) | Extracted by PageIndex |
-| **LLM reads** | Full text | Document trees |
-| **Result** | summary + concepts | summary + concepts |
+| **Convert** | markitdown → Markdown | Split by TOC → pymupdf4llm → segments |
+| **Tables/Layouts** | Basic extraction | Native table rendering + multi-column |
+| **Images** | Extracted inline (pymupdf) | Extracted with segments |
+| **Compilation** | Single-pass | Parallel compilation (concurrency: 3) |
+| **Deduplication** | Not needed | Segment + cross-doc concept merging |
+| **Result** | summary + concepts | summary + concepts (unified) |
 
-Short docs are read in full by the LLM. Long PDFs are indexed by PageIndex into a hierarchical tree with summaries. The LLM reads the tree instead of the full text, enabling better retrieval from long documents.
+Short docs are processed in a single pass. Large PDFs are automatically split by table of contents into chapter segments (max 40 pages each), compiled in parallel, then deduplicated to create unified concept pages.
 
 ### Knowledge Compilation
 
 When you add a document, the LLM:
 
-1. Generates a **summary** page
-2. Reads existing **concept** pages
-3. Creates or updates concepts with cross-document synthesis
-4. Updates the **index** and **log**
+1. **Converts** the document to Markdown (tables, images, layouts preserved)
+2. **Splits** large PDFs by TOC into manageable segments
+3. **Generates** a summary page with citation metadata
+4. **Plans** which concept pages to create or update
+5. **Generates/rewrites** concepts with source citations (book, pages, chapter, perspective)
+6. **Deduplicates** similar concepts from segments and across documents
+7. **Updates** the index and log with bidirectional links
 
-A single source might touch 10-15 wiki pages. Knowledge accumulates: each document enriches the existing wiki rather than sitting in isolation.
+A single document might touch 10-15 wiki pages. Knowledge accumulates: each document enriches the existing wiki rather than sitting in isolation. Citations enable verification and traceability.
 
 # ⚙️ Usage
 
@@ -188,7 +196,13 @@ Settings are initialized by `openkb init`, and stored in `.openkb/config.yaml`:
 ```yaml
 model: gpt-5.4                   # LLM model (any LiteLLM-supported provider)
 language: en                     # Wiki output language
-pageindex_threshold: 20          # PDF pages threshold for PageIndex
+pageindex_threshold: 20          # PDF pages threshold for splitting
+split_large_pdfs: true           # Enable TOC-based splitting for large PDFs
+split_by_toc: true               # Prefer TOC over fixed chunks
+chunk_size: 25                   # Fallback chunk size (pages)
+max_segment_pages: 40            # Max pages per segment
+pdf_engine: pymupdf4llm          # PDF conversion engine (pymupdf4llm or legacy)
+compile_concurrency: 3           # Parallel compilation limit
 ```
 
 Model names use `provider/model` LiteLLM [format](https://docs.litellm.ai/docs/providers) (OpenAI models can omit the prefix):

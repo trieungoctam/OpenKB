@@ -38,6 +38,13 @@ Operations: ingest, query, lint
 - Standard Markdown heading hierarchy
 - Keep each page focused on a single topic
 - Do not include YAML frontmatter (---) in generated content; it is managed by code
+
+## Citation Conventions
+- Concept pages include structured citations in YAML frontmatter
+- Each citation has: book, pages, chapter, perspective
+- Concept pages have "## Sources & Perspectives" section comparing sources
+- Multiple perspectives are compared and conflicts noted with blockquote callouts
+- Query answers include inline [Source: [[summaries/doc-name]], pp.X-Y] citations
 """
 
 # Backward compat alias

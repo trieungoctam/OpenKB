@@ -37,6 +37,7 @@ dependencies = [
     "json-repair",
     "prompt_toolkit>=3.0",
     "rich>=13.0",
+    "pymupdf4llm",
 ]
 
 [project.urls]

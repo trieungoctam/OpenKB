@@ -71,5 +71,19 @@ class TestLintCommand:
             result = runner.invoke(cli, ["lint"])
         assert result.exit_code == 0
         assert "Running structural lint" in result.output
-        assert "Running knowledge lint" in result.output
+        # With only 1 doc, semantic lint is skipped
+        assert "too small for semantic lint" in result.output
         assert "Report written to" in result.output
+
+    def test_lint_runs_knowledge_with_enough_docs(self, tmp_path):
+        """Knowledge lint runs when >= 3 documents."""
+        kb_dir = _setup_kb(tmp_path)
+        hashes = {f"hash{i}": {"name": f"doc{i}.pdf", "type": "pdf"} for i in range(3)}
+        (kb_dir / ".openkb" / "hashes.json").write_text(json.dumps(hashes))
+        runner = CliRunner()
+        with patch("openkb.cli._find_kb_dir", return_value=kb_dir), \
+             patch("openkb.cli._setup_llm_key"), \
+             patch("openkb.agent.linter.run_knowledge_lint", return_value="No issues."):
+            result = runner.invoke(cli, ["lint"])
+        assert result.exit_code == 0
+        assert "Running knowledge lint" in result.output

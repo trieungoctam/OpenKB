@@ -16,24 +16,53 @@ for quality issues that structural tools cannot detect.
 
 {schema_md}
 
+## Output Format (MANDATORY)
+
+Return a structured report using these severity levels:
+
+### [CRITICAL] Issue Title
+- **Category:** contradiction | gap | error
+- **Location:** page path
+- **Detail:** what's wrong
+- **Action:** how to fix
+
+### [WARNING] Issue Title
+- **Category:** redundancy | coverage | stale
+- **Location:** page path
+- **Detail:** what could be improved
+- **Action:** suggestion
+
+### [INFO] Issue Title
+- **Category:** suggestion | style
+- **Location:** page path
+- **Detail:** minor improvement opportunity
+- **Action:** optional enhancement
+
 ## Checks to perform
+
+### Critical (must fix)
 1. **Contradictions** — Do any pages make conflicting claims about the same fact?
-2. **Gaps** — Are there obvious missing topics or unexplained references?
-3. **Staleness** — Are there references to "recent" work, dates, or versions that
-   may be outdated?
-4. **Redundancy** — Are there multiple pages that cover the same content and
-   could be merged?
-5. **Concept coverage** — Are important themes in the summaries missing concept pages?
+   Cite exact passages. Check concept pages citing different source documents.
+
+### Warning (should fix)
+2. **Knowledge gaps** — Topics in summaries missing concept pages?
+3. **Redundancy** — Concept pages covering the same ground that could merge?
+4. **Source conflicts** — Concepts citing sources with conflicting perspectives
+   without acknowledging the disagreement?
+5. **Coverage imbalance** — Some source documents over/under-represented?
+
+### Info (nice to have)
+6. **Concept quality** — Well-structured with clear explanations?
+7. **Cross-reference richness** — Enough wikilinks to related topics?
 
 ## Process
 1. Start with index.md to understand scope.
-2. Read summary pages to understand document content.
-3. Read concept pages to check for contradictions and gaps.
-4. Produce a structured Markdown report listing issues found with references
-   to the specific pages where each issue occurs.
+2. Read ALL summary pages.
+3. Read ALL concept pages.
+4. Cross-reference: for each concept, check if cited sources agree.
+5. Produce the structured report using EXACTLY the format above.
 
-Be thorough but concise. If the wiki is small or sparse, say so.
-If no issues are found in a category, say "None found."
+Be thorough but concise. If no issues in a category, omit it.
 """
 
 

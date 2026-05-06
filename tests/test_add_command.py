@@ -83,15 +83,16 @@ class TestAddCommand:
         (docs_dir / "ignore.xyz").write_text("skip me")
 
         runner = CliRunner()
-        with patch("openkb.cli.add_single_file") as mock_add, \
+        with patch("openkb.cli._add_files_parallel") as mock_parallel, \
              patch("openkb.cli._find_kb_dir", return_value=kb_dir):
             result = runner.invoke(cli, ["add", str(docs_dir)])
-            # Should be called for .md and .txt but not .xyz
-            assert mock_add.call_count == 2
-            called_names = {call.args[0].name for call in mock_add.call_args_list}
-            assert "a.md" in called_names
-            assert "b.txt" in called_names
-            assert "ignore.xyz" not in called_names
+            # With 2 supported files and concurrency=3, parallel path is used
+            mock_parallel.assert_called_once()
+            files_arg = mock_parallel.call_args[0][0]
+            file_names = {f.name for f in files_arg}
+            assert "a.md" in file_names
+            assert "b.txt" in file_names
+            assert "ignore.xyz" not in file_names
 
     def test_add_unsupported_extension(self, tmp_path):
         kb_dir = self._setup_kb(tmp_path)

@@ -129,15 +129,8 @@ def _find_kb_dir(override: Path | None = None) -> Path | None:
 
 
 def add_single_file(file_path: Path, kb_dir: Path) -> None:
-    """Convert, index, and compile a single document into the knowledge base.
-
-    Steps:
-    1. Load config to get the model name.
-    2. Convert the document (hash-check; skip if already known).
-    3. If long doc: run PageIndex then compile_long_doc.
-    4. Else: compile_short_doc.
-    """
-    from openkb.agent.compiler import compile_long_doc, compile_short_doc
+    """Convert, index, and compile a single document into the knowledge base."""
+    from openkb.agent.compiler import compile_short_doc
     from openkb.state import HashRegistry
 
     logger = logging.getLogger(__name__)
@@ -147,7 +140,6 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
     model: str = config.get("model", DEFAULT_CONFIG["model"])
     registry = HashRegistry(openkb_dir / "hashes.json")
 
-    # 2. Convert document
     click.echo(f"Adding: {file_path.name}")
     try:
         result = convert_document(file_path, kb_dir)
@@ -160,41 +152,15 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
         click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
         return
 
-    doc_name = file_path.stem
-
-    # 3/4. Index and compile
-    if result.is_long_doc:
-        click.echo(f"  Long document detected — indexing with PageIndex...")
-        try:
-            from openkb.indexer import index_long_document
-            index_result = index_long_document(result.raw_path, kb_dir)
-        except Exception as exc:
-            click.echo(f"  [ERROR] Indexing failed: {exc}")
-            logger.debug("Indexing traceback:", exc_info=True)
-            return
-
-        summary_path = kb_dir / "wiki" / "summaries" / f"{doc_name}.md"
-        click.echo(f"  Compiling long doc (doc_id={index_result.doc_id})...")
-        for attempt in range(2):
-            try:
-                asyncio.run(
-                    compile_long_doc(doc_name, summary_path, index_result.doc_id, kb_dir, model,
-                                     doc_description=index_result.description)
-                )
-                break
-            except Exception as exc:
-                if attempt == 0:
-                    click.echo(f"  Retrying compilation in 2s...")
-                    time.sleep(2)
-                else:
-                    click.echo(f"  [ERROR] Compilation failed: {exc}")
-                    logger.debug("Compilation traceback:", exc_info=True)
-                    return
+    if result.is_large_pdf:
+        _compile_large_pdf(file_path, result, kb_dir, model, config)
+    elif result.is_long_doc:
+        _compile_long_doc(file_path, result, kb_dir, model)
     else:
         click.echo(f"  Compiling short doc...")
         for attempt in range(2):
             try:
-                asyncio.run(compile_short_doc(doc_name, result.source_path, kb_dir, model))
+                asyncio.run(compile_short_doc(file_path.stem, result.source_path, kb_dir, model))
                 break
             except Exception as exc:
                 if attempt == 0:
@@ -205,13 +171,147 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
                     logger.debug("Compilation traceback:", exc_info=True)
                     return
 
-    # Register hash only after successful compilation
     if result.file_hash:
         doc_type = "long_pdf" if result.is_long_doc else file_path.suffix.lstrip(".")
         registry.add(result.file_hash, {"name": file_path.name, "type": doc_type})
 
     append_log(kb_dir / "wiki", "ingest", file_path.name)
     click.echo(f"  [OK] {file_path.name} added to knowledge base.")
+
+
+def _compile_large_pdf(file_path: Path, result, kb_dir: Path, model: str, config: dict) -> None:
+    """Process a large PDF through segment splitting and sequential compilation."""
+    from openkb.agent.compiler import compile_short_doc
+    from openkb.splitter import split_pdf
+    from openkb.converter import convert_segment
+    from openkb.merger import merge_segment_concepts
+
+    logger = logging.getLogger(__name__)
+    doc_name = file_path.stem
+    segments_dir = kb_dir / ".openkb" / "segments" / doc_name
+    segments_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        segments = split_pdf(result.raw_path, segments_dir, config)
+        click.echo(f"  Split into {len(segments)} segments")
+
+        for i, seg in enumerate(segments, 1):
+            click.echo(f"  [{i}/{len(segments)}] {seg.chapter_title} (pp.{seg.page_range_str})...")
+            seg_source = convert_segment(seg, doc_name, kb_dir, config=config)
+            seg_doc_name = f"{doc_name}-{seg.slug}"
+            for attempt in range(2):
+                try:
+                    asyncio.run(compile_short_doc(seg_doc_name, seg_source, kb_dir, model))
+                    break
+                except Exception as exc:
+                    if attempt == 0:
+                        click.echo(f"  Retrying compilation in 2s...")
+                        time.sleep(2)
+                    else:
+                        click.echo(f"  [ERROR] Segment compilation failed: {exc}")
+                        logger.debug("Segment compilation traceback:", exc_info=True)
+
+        merge_result = merge_segment_concepts(kb_dir / "wiki", doc_name)
+        if merge_result["merged"] > 0:
+            click.echo(f"  Merged {merge_result['merged']} duplicate concepts")
+    except Exception as exc:
+        click.echo(f"  [ERROR] Split processing failed: {exc}")
+        logger.debug("Split processing traceback:", exc_info=True)
+    finally:
+        import shutil
+        if segments_dir.exists():
+            shutil.rmtree(segments_dir, ignore_errors=True)
+
+
+def _compile_long_doc(file_path: Path, result, kb_dir: Path, model: str) -> None:
+    """Process a long document via PageIndex."""
+    from openkb.agent.compiler import compile_long_doc
+
+    logger = logging.getLogger(__name__)
+    doc_name = file_path.stem
+    click.echo(f"  Long document detected — indexing with PageIndex...")
+    try:
+        from openkb.indexer import index_long_document
+        index_result = index_long_document(result.raw_path, kb_dir)
+    except Exception as exc:
+        click.echo(f"  [ERROR] Indexing failed: {exc}")
+        logger.debug("Indexing traceback:", exc_info=True)
+        return
+
+    summary_path = kb_dir / "wiki" / "summaries" / f"{doc_name}.md"
+    click.echo(f"  Compiling long doc (doc_id={index_result.doc_id})...")
+    for attempt in range(2):
+        try:
+            asyncio.run(
+                compile_long_doc(doc_name, summary_path, index_result.doc_id, kb_dir, model,
+                                 doc_description=index_result.description)
+            )
+            break
+        except Exception as exc:
+            if attempt == 0:
+                click.echo(f"  Retrying compilation in 2s...")
+                time.sleep(2)
+            else:
+                click.echo(f"  [ERROR] Compilation failed: {exc}")
+                logger.debug("Compilation traceback:", exc_info=True)
+
+
+def _add_files_parallel(files: list[Path], kb_dir: Path, max_concurrency: int) -> None:
+    """Add multiple files with parallel short-doc compilation."""
+    from openkb.agent.batch import compile_batch
+    from openkb.state import HashRegistry
+
+    openkb_dir = kb_dir / ".openkb"
+    config = load_config(openkb_dir / "config.yaml")
+    _setup_llm_key(kb_dir)
+    model: str = config.get("model", DEFAULT_CONFIG["model"])
+    registry = HashRegistry(openkb_dir / "hashes.json")
+
+    # Phase 1: Convert all files and route to appropriate pipeline
+    short_tasks = []
+    for f in files:
+        click.echo(f"\nConverting: {f.name}")
+        try:
+            result = convert_document(f, kb_dir)
+        except Exception as e:
+            click.echo(f"  [ERROR] Conversion failed: {e}")
+            continue
+        if result.skipped:
+            click.echo(f"  [SKIP] Already in knowledge base")
+            continue
+
+        if result.is_large_pdf:
+            _compile_large_pdf(f, result, kb_dir, model, config)
+            if result.file_hash:
+                registry.add(result.file_hash, {"name": f.name, "type": f.suffix.lstrip(".")})
+            append_log(kb_dir / "wiki", "ingest", f.name)
+        elif result.is_long_doc:
+            _compile_long_doc(f, result, kb_dir, model)
+            if result.file_hash:
+                registry.add(result.file_hash, {"name": f.name, "type": "long_pdf"})
+            append_log(kb_dir / "wiki", "ingest", f.name)
+        else:
+            short_tasks.append((f, result))
+
+    # Phase 2: Compile short docs in parallel
+    if short_tasks:
+        doc_tasks = [
+            {"doc_name": f.stem, "source_path": r.source_path}
+            for f, r in short_tasks
+        ]
+        click.echo(f"\nCompiling {len(doc_tasks)} document(s) (concurrency={max_concurrency})...")
+        batch_results = asyncio.run(compile_batch(doc_tasks, kb_dir, model, max_concurrency))
+
+        for (f, result), batch_result in zip(short_tasks, batch_results):
+            if batch_result["status"] == "ok" and result.file_hash:
+                registry.add(result.file_hash, {"name": f.name, "type": f.suffix.lstrip(".")})
+                append_log(kb_dir / "wiki", "ingest", f.name)
+
+    # Phase 3: Cross-doc concept merge
+    from openkb.merger import merge_cross_doc_concepts
+    merge_result = merge_cross_doc_concepts(kb_dir / "wiki")
+    if merge_result["merged"] > 0:
+        click.echo(f"  Cross-doc merge: {merge_result['merged']} concepts merged")
 
 
 # ---------------------------------------------------------------------------
@@ -344,9 +444,16 @@ def add(ctx, path):
             return
         total = len(files)
         click.echo(f"Found {total} supported file(s) in {path}.")
-        for i, f in enumerate(files, 1):
-            click.echo(f"\n[{i}/{total}] ", nl=False)
-            add_single_file(f, kb_dir)
+
+        config = load_config(kb_dir / ".openkb" / "config.yaml")
+        concurrency = config.get("compile_concurrency", 3)
+
+        if total > 1 and concurrency > 1:
+            _add_files_parallel(files, kb_dir, concurrency)
+        else:
+            for i, f in enumerate(files, 1):
+                click.echo(f"\n[{i}/{total}] ", nl=False)
+                add_single_file(f, kb_dir)
     else:
         if target.suffix.lower() not in SUPPORTED_EXTENSIONS:
             click.echo(
@@ -542,7 +649,13 @@ async def run_lint(kb_dir: Path) -> Path | None:
     Async because knowledge lint uses an LLM agent. Usable from CLI
     (via ``asyncio.run``) and directly from the chat REPL.
     """
-    from openkb.lint import run_structural_lint
+    from openkb.lint import (
+        run_structural_lint,
+        check_source_diversity,
+        check_concept_clusters,
+        check_book_coverage,
+        format_severity_report,
+    )
     from openkb.agent.linter import run_knowledge_lint
 
     openkb_dir = kb_dir / ".openkb"
@@ -561,24 +674,46 @@ async def run_lint(kb_dir: Path) -> Path | None:
     _setup_llm_key(kb_dir)
     model: str = config.get("model", DEFAULT_CONFIG["model"])
 
+    wiki = kb_dir / "wiki"
+
     click.echo("Running structural lint...")
     structural_report = run_structural_lint(kb_dir)
     click.echo(structural_report)
 
-    click.echo("Running knowledge lint...")
-    try:
-        knowledge_report = await run_knowledge_lint(kb_dir, model)
-    except Exception as exc:
-        knowledge_report = f"Knowledge lint failed: {exc}"
-    click.echo(knowledge_report)
+    # Code-based severity checks
+    click.echo("Running code-based checks...")
+    code_issues = []
+    code_issues.extend(check_source_diversity(wiki))
+    code_issues.extend(check_concept_clusters(wiki))
+    code_issues.extend(check_book_coverage(wiki))
+    if code_issues:
+        for issue in code_issues:
+            click.echo(f"  [{issue.severity.value}] {issue.title}")
+    else:
+        click.echo("  No code-based issues found.")
 
-    # Write combined report
+    # LLM-based semantic lint (skip for tiny wikis)
+    knowledge_report = ""
+    if len(hashes) >= 3:
+        click.echo("Running knowledge lint...")
+        try:
+            knowledge_report = await run_knowledge_lint(kb_dir, model)
+        except Exception as exc:
+            knowledge_report = f"Knowledge lint failed: {exc}"
+        click.echo(knowledge_report)
+    else:
+        knowledge_report = "Skipped — wiki has fewer than 3 documents."
+        click.echo("Wiki too small for semantic lint (< 3 documents).")
+
+    # Combine into structured report
     reports_dir = kb_dir / "wiki" / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     import datetime
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = reports_dir / f"lint_{timestamp}.md"
-    report_content = f"# Lint Report — {timestamp}\n\n## Structural\n\n{structural_report}\n\n## Semantic\n\n{knowledge_report}\n"
+
+    full_report = format_severity_report(code_issues, structural_report, knowledge_report)
+    report_content = f"# Lint Report — {timestamp}\n\n{full_report}\n"
     report_path.write_text(report_content, encoding="utf-8")
     append_log(kb_dir / "wiki", "lint", f"report → {report_path.name}")
     click.echo(f"\nReport written to {report_path}")

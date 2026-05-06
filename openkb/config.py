@@ -9,6 +9,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-5.4-mini",
     "language": "en",
     "pageindex_threshold": 20,
+    "split_large_pdfs": True,
+    "split_by_toc": True,
+    "chunk_size": 25,
+    "max_segment_pages": 40,
+    "pdf_engine": "pymupdf4llm",
+    "compile_concurrency": 3,
+    "describe_images": True,
+    "vision_model": None,
+    "max_describe_images": 50,
 }
 
 GLOBAL_CONFIG_DIR = Path.home() / ".config" / "openkb"
