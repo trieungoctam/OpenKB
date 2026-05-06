@@ -180,3 +180,41 @@ class TestEncodeImage:
         img.write_bytes(b"\x89PNG\r\n\x1a\n")
         result = _encode_image(img)
         assert result.startswith("data:image/png;base64,")
+
+
+class TestImagePathsSpecialCharacters:
+    def test_path_with_parentheses_in_filename(self, tmp_path: Path):
+        """Image paths containing parentheses (common in book names) must match."""
+        kb_dir = tmp_path
+        # Create directory and image with parens in name
+        img_dir = kb_dir / "wiki" / "sources" / "images" / "Book (Author) (site.com)"
+        img_path = img_dir / "p1_img1.png"
+        _make_image(img_path)
+
+        md = "![image](sources/images/Book (Author) (site.com)/p1_img1.png)"
+
+        with patch("openkb.image_describer.completion", return_value=_mock_response("Chart")):
+            result = describe_images(md, kb_dir, "gpt-4o")
+
+        assert "*[Figure: Chart]*" in result
+
+    def test_multiple_images_with_parens(self, tmp_path: Path):
+        """Multiple images with parenthesized paths all get described."""
+        kb_dir = tmp_path
+        base = kb_dir / "wiki" / "sources" / "images" / "My Book (2nd Ed)"
+        _make_image(base / "a.png")
+        _make_image(base / "b.png")
+
+        md = (
+            "![x](sources/images/My Book (2nd Ed)/a.png)\n\n"
+            "Text\n\n"
+            "![y](sources/images/My Book (2nd Ed)/b.png)"
+        )
+        with patch(
+            "openkb.image_describer.completion",
+            side_effect=[_mock_response("Img A"), _mock_response("Img B")],
+        ):
+            result = describe_images(md, kb_dir, "gpt-4o")
+
+        assert "*[Figure: Img A]*" in result
+        assert "*[Figure: Img B]*" in result

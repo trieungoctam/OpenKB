@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 _BASE64_RE = re.compile(r'!\[([^\]]*)\]\(data:image/([^;]+);base64,([^)]+)\)')
 
 # Matches: ![alt](relative/path) — excludes http(s):// and data: URIs
-_RELATIVE_RE = re.compile(r'!\[([^\]]*)\]\((?!https?://|data:)([^)]+)\)')
+# Handles paths with parentheses by matching greedily until final .ext)
+_RELATIVE_RE = re.compile(r'!\[([^\]]*)\]\((?!https?://|data:)([^)]+\.\w+)\)')
 
 
 # Minimum pixel dimension — skip icons, bullets, and tiny artifacts

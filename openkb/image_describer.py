@@ -5,12 +5,13 @@ import base64
 import logging
 import re
 from pathlib import Path
+from urllib.parse import unquote
 
 from litellm import completion
 
 logger = logging.getLogger(__name__)
 
-_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\((?!https?://|data:)([^)]+)\)")
+_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\((?!https?://|data:)(.+?\.(?:png|jpe?g|gif|webp|svg))\)")
 
 _DESCRIBE_PROMPT = """\
 Analyze this image from an educational textbook. Describe:
@@ -104,7 +105,7 @@ def describe_images(
             )
             break
 
-        rel_path = match.group(2)
+        rel_path = unquote(match.group(2))
         image_path = (wiki_dir / rel_path).resolve()
 
         # Path traversal guard
@@ -113,7 +114,7 @@ def describe_images(
             continue
 
         if not image_path.exists():
-            logger.warning("Image not found, skipping description: %s", rel_path)
+            logger.warning("Image not found: %s (resolved: %s)", rel_path, image_path)
             continue
 
         # Size guard
