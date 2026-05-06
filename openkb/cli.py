@@ -734,6 +734,74 @@ def lint(ctx, fix):
     asyncio.run(run_lint(kb_dir))
 
 
+@cli.command()
+@click.option("--describe-images", "describe_images_flag", is_flag=True, default=False,
+              help="Retroactively add VLM descriptions to images in existing wiki/sources/.")
+@click.pass_context
+def upgrade(ctx, describe_images_flag):
+    """Upgrade existing wiki data with new features (no re-compilation)."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    if not describe_images_flag:
+        click.echo("No upgrade step specified. Use --describe-images to add image descriptions.")
+        return
+
+    _setup_llm_key(kb_dir)
+    openkb_dir = kb_dir / ".openkb"
+    config = load_config(openkb_dir / "config.yaml")
+    model = config.get("vision_model") or config.get("model", "gpt-4o-mini")
+
+    from openkb.image_describer import describe_images, _IMAGE_RE
+
+    sources_dir = kb_dir / "wiki" / "sources"
+    source_files = sorted(sources_dir.glob("*.md"))
+    if not source_files:
+        click.echo("No source files found in wiki/sources/.")
+        return
+
+    # Pattern to detect images already having descriptions
+    _DESCRIBED_RE = _IMAGE_RE
+
+    total_images = 0
+    updated_files = 0
+
+    for src_file in source_files:
+        markdown = src_file.read_text(encoding="utf-8")
+
+        # Count images without descriptions below them
+        matches = list(_IMAGE_RE.finditer(markdown))
+        if not matches:
+            continue
+
+        # Check which images already have descriptions
+        needs_desc = []
+        for m in matches:
+            after = markdown[m.end():]
+            # If *[Figure: appears right after (within 50 chars), skip
+            if "*[Figure:" in after[:50]:
+                continue
+            needs_desc.append(m)
+
+        if not needs_desc:
+            continue
+
+        click.echo(f"  {src_file.name}: {len(needs_desc)} images need descriptions")
+        total_images += len(needs_desc)
+
+        enriched = describe_images(markdown, kb_dir, model)
+        if enriched != markdown:
+            src_file.write_text(enriched, encoding="utf-8")
+            updated_files += 1
+
+    if total_images == 0:
+        click.echo("All images already have descriptions. Nothing to upgrade.")
+    else:
+        click.echo(f"Done. Described {total_images} images across {updated_files} files.")
+
+
 def print_list(kb_dir: Path) -> None:
     """Print all documents in the knowledge base. Usable from CLI and chat REPL."""
     openkb_dir = kb_dir / ".openkb"
