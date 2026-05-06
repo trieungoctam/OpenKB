@@ -42,9 +42,24 @@ Operations: ingest, query, lint
 ## Citation Conventions
 - Concept pages include structured citations in YAML frontmatter
 - Each citation has: book, pages, chapter, perspective
+- Concept pages include 3-5 lowercase topic tags (e.g., ["methodology", "startups"])
 - Concept pages have "## Sources & Perspectives" section comparing sources
 - Multiple perspectives are compared and conflicts noted with blockquote callouts
 - Query answers include inline [Source: [[summaries/doc-name]], pp.X-Y] citations
+
+## Deep Study Sections
+- Concept pages include active learning content as collapsible Obsidian callouts:
+  - `> [!tip]- ELI5` — Simple explanation without jargon
+  - `> [!tip]- Real-World Analogy` — Everyday analogy
+  - `> [!warning]- Common Misconceptions` — Myths vs reality
+  - `> [!question]- Check Your Understanding` — Q&A pairs
+  - `> [!info]- Why It Matters` — Practical significance
+- Questions use **Q:** and **A:** format for plugin parsing
+
+## Tracking Fields (Concept Frontmatter)
+- `understanding_level`: unreviewed | confused | partial | understood
+- `last_reviewed`: ISO date or null
+- `review_count`: integer
 """
 
 # Backward compat alias

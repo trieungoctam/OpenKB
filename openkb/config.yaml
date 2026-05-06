@@ -1,0 +1,9 @@
+model: gpt-5.4-mini              # LLM model (any LiteLLM-supported provider)
+language: en                     # Wiki output language
+pageindex_threshold: 20          # PDF pages threshold for PageIndex
+  
+split_large_pdfs: true
+split_by_toc: true
+chunk_size: 1024
+max_segment_pages: 40
+pdf_engine: pymupdf4llm

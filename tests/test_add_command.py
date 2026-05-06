@@ -72,7 +72,7 @@ class TestAddCommand:
         with patch("openkb.cli.add_single_file") as mock_add, \
              patch("openkb.cli._find_kb_dir", return_value=kb_dir):
             result = runner.invoke(cli, ["add", str(doc)])
-            mock_add.assert_called_once_with(doc, kb_dir)
+            mock_add.assert_called_once_with(doc, kb_dir, force=False)
 
     def test_add_directory_calls_helper_for_each_file(self, tmp_path):
         kb_dir = self._setup_kb(tmp_path)

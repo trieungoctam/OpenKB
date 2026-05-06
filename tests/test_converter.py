@@ -44,7 +44,9 @@ class TestConvertDocumentMarkdown:
         assert result.is_long_doc is False
         assert result.source_path is not None
         assert result.source_path.exists()
-        assert result.source_path.read_text(encoding="utf-8").startswith("# Notes")
+        content = result.source_path.read_text(encoding="utf-8")
+        assert "type: source" in content
+        assert "# Notes" in content
 
     def test_md_duplicate_skipped(self, kb_dir):
         """Second call with same file returns skipped=True when hash is registered."""

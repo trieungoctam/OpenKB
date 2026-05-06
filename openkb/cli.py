@@ -128,7 +128,7 @@ def _find_kb_dir(override: Path | None = None) -> Path | None:
     return None
 
 
-def add_single_file(file_path: Path, kb_dir: Path) -> None:
+def add_single_file(file_path: Path, kb_dir: Path, *, force: bool = False) -> None:
     """Convert, index, and compile a single document into the knowledge base."""
     from openkb.agent.compiler import compile_short_doc
     from openkb.state import HashRegistry
@@ -142,7 +142,7 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
 
     click.echo(f"Adding: {file_path.name}")
     try:
-        result = convert_document(file_path, kb_dir)
+        result = convert_document(file_path, kb_dir, force=force)
     except Exception as exc:
         click.echo(f"  [ERROR] Conversion failed: {exc}")
         logger.debug("Conversion traceback:", exc_info=True)
@@ -160,7 +160,7 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
         click.echo(f"  Compiling short doc...")
         for attempt in range(2):
             try:
-                asyncio.run(compile_short_doc(file_path.stem, result.source_path, kb_dir, model))
+                asyncio.run(compile_short_doc(result.doc_name, result.source_path, kb_dir, model))
                 break
             except Exception as exc:
                 if attempt == 0:
@@ -187,7 +187,7 @@ def _compile_large_pdf(file_path: Path, result, kb_dir: Path, model: str, config
     from openkb.merger import merge_segment_concepts
 
     logger = logging.getLogger(__name__)
-    doc_name = file_path.stem
+    doc_name = result.doc_name
     segments_dir = kb_dir / ".openkb" / "segments" / doc_name
     segments_dir.mkdir(parents=True, exist_ok=True)
 
@@ -228,7 +228,7 @@ def _compile_long_doc(file_path: Path, result, kb_dir: Path, model: str) -> None
     from openkb.agent.compiler import compile_long_doc
 
     logger = logging.getLogger(__name__)
-    doc_name = file_path.stem
+    doc_name = result.doc_name
     click.echo(f"  Long document detected — indexing with PageIndex...")
     try:
         from openkb.indexer import index_long_document
@@ -256,7 +256,7 @@ def _compile_long_doc(file_path: Path, result, kb_dir: Path, model: str) -> None
                 logger.debug("Compilation traceback:", exc_info=True)
 
 
-def _add_files_parallel(files: list[Path], kb_dir: Path, max_concurrency: int) -> None:
+def _add_files_parallel(files: list[Path], kb_dir: Path, max_concurrency: int, *, force: bool = False) -> None:
     """Add multiple files with parallel short-doc compilation."""
     from openkb.agent.batch import compile_batch
     from openkb.state import HashRegistry
@@ -272,7 +272,7 @@ def _add_files_parallel(files: list[Path], kb_dir: Path, max_concurrency: int) -
     for f in files:
         click.echo(f"\nConverting: {f.name}")
         try:
-            result = convert_document(f, kb_dir)
+            result = convert_document(f, kb_dir, force=force)
         except Exception as e:
             click.echo(f"  [ERROR] Conversion failed: {e}")
             continue
@@ -296,7 +296,7 @@ def _add_files_parallel(files: list[Path], kb_dir: Path, max_concurrency: int) -
     # Phase 2: Compile short docs in parallel
     if short_tasks:
         doc_tasks = [
-            {"doc_name": f.stem, "source_path": r.source_path}
+            {"doc_name": r.doc_name, "source_path": r.source_path}
             for f, r in short_tasks
         ]
         click.echo(f"\nCompiling {len(doc_tasks)} document(s) (concurrency={max_concurrency})...")
@@ -421,8 +421,10 @@ def init():
 
 @cli.command()
 @click.argument("path")
+@click.option("--force", is_flag=True, default=False,
+              help="Re-process even if file already exists in knowledge base.")
 @click.pass_context
-def add(ctx, path):
+def add(ctx, path, force):
     """Add a document or directory of documents at PATH to the knowledge base."""
     kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
     if kb_dir is None:
@@ -449,11 +451,11 @@ def add(ctx, path):
         concurrency = config.get("compile_concurrency", 3)
 
         if total > 1 and concurrency > 1:
-            _add_files_parallel(files, kb_dir, concurrency)
+            _add_files_parallel(files, kb_dir, concurrency, force=force)
         else:
             for i, f in enumerate(files, 1):
                 click.echo(f"\n[{i}/{total}] ", nl=False)
-                add_single_file(f, kb_dir)
+                add_single_file(f, kb_dir, force=force)
     else:
         if target.suffix.lower() not in SUPPORTED_EXTENSIONS:
             click.echo(
@@ -461,7 +463,7 @@ def add(ctx, path):
                 f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
             )
             return
-        add_single_file(target, kb_dir)
+        add_single_file(target, kb_dir, force=force)
 
 
 @cli.command()
@@ -737,17 +739,64 @@ def lint(ctx, fix):
 @cli.command()
 @click.option("--describe-images", "describe_images_flag", is_flag=True, default=False,
               help="Retroactively add VLM descriptions to images in existing wiki/sources/.")
+@click.option("--enrich-frontmatter", "enrich_frontmatter_flag", is_flag=True, default=False,
+              help="Add missing YAML frontmatter fields (type, title, date, tags) to wiki pages.")
+@click.option("--deep-study", "deep_study_flag", is_flag=True, default=False,
+              help="Generate deep study content (ELI5, analogies, questions) for existing concept pages.")
 @click.pass_context
-def upgrade(ctx, describe_images_flag):
+def upgrade(ctx, describe_images_flag, enrich_frontmatter_flag, deep_study_flag):
     """Upgrade existing wiki data with new features (no re-compilation)."""
     kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
     if kb_dir is None:
         click.echo("No knowledge base found. Run `openkb init` first.")
         return
 
-    if not describe_images_flag:
-        click.echo("No upgrade step specified. Use --describe-images to add image descriptions.")
+    if not describe_images_flag and not enrich_frontmatter_flag and not deep_study_flag:
+        click.echo("No upgrade step specified. Use --describe-images, --enrich-frontmatter, or --deep-study.")
         return
+
+    # --enrich-frontmatter: add missing YAML fields to wiki pages
+    if enrich_frontmatter_flag:
+        from openkb.frontmatter import enrich_directory
+
+        wiki_dir = kb_dir / "wiki"
+        total = 0
+        total += enrich_directory(wiki_dir / "sources", "source")
+        total += enrich_directory(wiki_dir / "summaries", "summary")
+        total += enrich_directory(wiki_dir / "concepts", "concept")
+        if total == 0:
+            click.echo("All pages already have complete frontmatter. Nothing to upgrade.")
+        else:
+            click.echo(f"Enriched {total} pages with frontmatter fields.")
+        if not describe_images_flag and not deep_study_flag:
+            return
+
+    # --deep-study: generate active learning content for concept pages
+    if deep_study_flag:
+        _setup_llm_key(kb_dir)
+        openkb_dir = kb_dir / ".openkb"
+        config = load_config(openkb_dir / "config.yaml")
+        model = config.get("model", "gpt-4o-mini")
+        wiki_dir = kb_dir / "wiki"
+        concepts_dir = wiki_dir / "concepts"
+
+        from openkb.agent.compiler import generate_deep_study_for_concept
+
+        concept_files = sorted(concepts_dir.glob("*.md")) if concepts_dir.exists() else []
+        if not concept_files:
+            click.echo("No concept pages found.")
+        else:
+            generated = 0
+            for cf in concept_files:
+                if generate_deep_study_for_concept(cf, model, wiki_dir):
+                    click.echo(f"  Generated deep study: {cf.name}")
+                    generated += 1
+            if generated == 0:
+                click.echo("All concept pages already have deep study content.")
+            else:
+                click.echo(f"Done. Generated deep study for {generated} concept page(s).")
+        if not describe_images_flag:
+            return
 
     _setup_llm_key(kb_dir)
     openkb_dir = kb_dir / ".openkb"
@@ -791,7 +840,7 @@ def upgrade(ctx, describe_images_flag):
         click.echo(f"  {src_file.name}: {len(needs_desc)} images need descriptions")
         total_images += len(needs_desc)
 
-        enriched = describe_images(markdown, kb_dir, model)
+        enriched = describe_images(markdown, kb_dir, model, max_images=len(needs_desc))
         if enriched != markdown:
             src_file.write_text(enriched, encoding="utf-8")
             updated_files += 1

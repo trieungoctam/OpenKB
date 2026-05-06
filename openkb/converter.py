@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 from pathlib import Path
 
@@ -16,6 +18,14 @@ from openkb.state import HashRegistry
 
 logger = logging.getLogger(__name__)
 
+# Characters that break markdown links or filesystem paths
+_UNSAFE_DOCNAME_RE = re.compile(r"[()\"\']")
+
+
+def _sanitize_doc_name(name: str) -> str:
+    """Remove characters that break markdown image links or cause path issues."""
+    return _UNSAFE_DOCNAME_RE.sub("", name).strip()
+
 
 @dataclass
 class ConvertResult:
@@ -27,6 +37,7 @@ class ConvertResult:
     is_large_pdf: bool = False
     skipped: bool = False
     file_hash: str | None = None  # For deferred hash registration
+    doc_name: str | None = None   # Sanitized document name
 
 
 def get_pdf_page_count(path: Path) -> int:
@@ -35,7 +46,7 @@ def get_pdf_page_count(path: Path) -> int:
         return doc.page_count
 
 
-def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
+def convert_document(src: Path, kb_dir: Path, *, force: bool = False) -> ConvertResult:
     """Convert a document and integrate it into the knowledge base.
 
     Steps:
@@ -53,12 +64,13 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
     config = load_config(openkb_dir / "config.yaml")
     threshold: int = config.get("pageindex_threshold", 20)
     registry = HashRegistry(openkb_dir / "hashes.json")
+    doc_name = _sanitize_doc_name(src.stem)
 
     # ------------------------------------------------------------------
     # 1. Hash check
     # ------------------------------------------------------------------
     file_hash = HashRegistry.hash_file(src)
-    if registry.is_known(file_hash):
+    if not force and registry.is_known(file_hash):
         logger.info("Skipping already-known file: %s", src.name)
         return ConvertResult(skipped=True)
 
@@ -86,6 +98,7 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
                 )
                 return ConvertResult(
                     raw_path=raw_dest, is_large_pdf=True, file_hash=file_hash,
+                    doc_name=doc_name,
                 )
             logger.info(
                 "Long PDF detected (%d pages >= %d threshold): %s",
@@ -93,17 +106,15 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
                 threshold,
                 src.name,
             )
-            return ConvertResult(raw_path=raw_dest, is_long_doc=True, file_hash=file_hash)
+            return ConvertResult(raw_path=raw_dest, is_long_doc=True, file_hash=file_hash, doc_name=doc_name)
 
     # ------------------------------------------------------------------
     # 4/5. Convert to Markdown
     # ------------------------------------------------------------------
     sources_dir = kb_dir / "wiki" / "sources"
     sources_dir.mkdir(parents=True, exist_ok=True)
-    images_dir = kb_dir / "wiki" / "sources" / "images" / src.stem
+    images_dir = kb_dir / "wiki" / "sources" / "images" / doc_name
     images_dir.mkdir(parents=True, exist_ok=True)
-
-    doc_name = src.stem
 
     if src.suffix.lower() == ".md":
         markdown = src.read_text(encoding="utf-8")
@@ -131,9 +142,17 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
         markdown = describe_images(markdown, kb_dir, vision_model, max_images=max_images)
 
     dest_md = sources_dir / f"{doc_name}.md"
-    dest_md.write_text(markdown, encoding="utf-8")
+    source_fm = (
+        f"---\n"
+        f"type: source\n"
+        f"title: \"{doc_name}\"\n"
+        f"original_file: \"{src.name}\"\n"
+        f"date: {date.today().isoformat()}\n"
+        f"---\n\n"
+    )
+    dest_md.write_text(source_fm + markdown, encoding="utf-8")
 
-    return ConvertResult(raw_path=raw_dest, source_path=dest_md, file_hash=file_hash)
+    return ConvertResult(raw_path=raw_dest, source_path=dest_md, file_hash=file_hash, doc_name=doc_name)
 
 
 def convert_segment(

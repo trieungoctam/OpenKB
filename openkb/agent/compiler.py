@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import unicodedata
+from datetime import date
 from pathlib import Path
 
 import litellm
@@ -64,7 +65,7 @@ Existing concept pages:
 Return a JSON object with three keys:
 
 1. "create" — new concepts not covered by any existing page. Array of objects:
-   {{"name": "concept-slug", "title": "Human-Readable Title"}}
+   {{"name": "short-slug", "title": "Human-Readable Title"}}
 
 2. "update" — existing concepts that have significant new information from \
 this document worth integrating. Array of objects:
@@ -79,6 +80,13 @@ Rules:
 - Do NOT create concepts that are just the document topic itself.
 - "related" is for lightweight cross-linking only, no content rewrite needed.
 
+Slug naming rules (CRITICAL):
+- Use 1-3 words, lowercase, hyphenated. Examples: "lean-validation", \
+"problem-interview", "innovation-accounting"
+- NEVER use long phrases, sentences, or document titles as slugs
+- The "title" field carries the full human-readable name; "name" is only a \
+short identifier for the filename
+
 Return ONLY valid JSON, no fences, no explanation.
 """
 
@@ -92,12 +100,20 @@ Include a "## Sources & Perspectives" section at the end listing each source \
 with page/chapter references and a 1-2 sentence summary of that source's view.
 {citation_context}
 
-Return a JSON object with three keys:
+Return a JSON object with five keys:
 - "brief": A single sentence (under 100 chars) defining this concept
+- "tags": Array of 3-5 lowercase topic tags (e.g., ["methodology", "startups"])
 - "citations": Array of objects with keys: book, pages (string), chapter, perspective
 - "content": The full concept page in Markdown. Include clear explanation, \
 key details from the source document, and [[wikilinks]] to related concepts \
 and [[summaries/{doc_name}]]
+- "deep_study": Object for active learning, with keys:
+  - "eli5": One-paragraph simple explanation (avoid jargon)
+  - "analogy": A concrete everyday analogy
+  - "misconceptions": 2-3 common misunderstandings as **Myth:** X **Reality:** Y pairs
+  - "questions": 3-5 non-trivial understanding-check questions with hidden answers \
+as **Q:** question **A:** answer pairs
+  - "why_it_matters": Why this concept matters in practice (1-2 sentences)
 
 Return ONLY valid JSON, no fences.
 """
@@ -118,10 +134,14 @@ Citation rules:
 3. If the new source conflicts with existing ones, add a note callout
 4. Maintain existing [[wikilinks]] and add new ones where appropriate
 
-Return a JSON object with three keys:
+Return a JSON object with five keys:
 - "brief": A single sentence (under 100 chars) defining this concept (may differ from before)
+- "tags": Array of 3-5 lowercase topic tags, updated based on new information
 - "citations": Complete array of citation objects (existing + new), each with: book, pages, chapter, perspective
 - "content": The rewritten full concept page in Markdown
+- "deep_study": Object for active learning, with keys: "eli5" (simple explanation), \
+"analogy" (everyday analogy), "misconceptions" (myths vs reality), "questions" \
+(3-5 Q&A pairs), "why_it_matters" (practical significance). Refresh based on ALL known sources.
 
 Return ONLY valid JSON, no fences.
 """
@@ -135,6 +155,21 @@ Based on this structured summary, write a concise overview that captures \
 the key themes and findings. This will be used to generate concept pages.
 
 Return ONLY the Markdown content (no frontmatter, no code fences).
+"""
+
+_DEEP_STUDY_UPGRADE_PROMPT = """\
+Based on this concept page, generate active learning content for deep study.
+
+Return a JSON object with one key:
+- "deep_study": Object with keys:
+  - "eli5": One-paragraph simple explanation (avoid jargon)
+  - "analogy": A concrete everyday analogy
+  - "misconceptions": 2-3 common misunderstandings as **Myth:** X **Reality:** Y pairs
+  - "questions": 3-5 non-trivial understanding-check questions with hidden answers \
+as **Q:** question **A:** answer pairs
+  - "why_it_matters": Why this concept matters in practice (1-2 sentences)
+
+Return ONLY valid JSON, no fences.
 """
 
 
@@ -357,7 +392,12 @@ def _write_summary(wiki_dir: Path, doc_name: str, summary: str,
     summaries_dir = wiki_dir / "summaries"
     summaries_dir.mkdir(parents=True, exist_ok=True)
     ext = "md" if doc_type == "short" else "json"
+    today = date.today().isoformat()
     fm_lines = [
+        f"type: summary",
+        f"title: \"{doc_name}\"",
+        f"date: {today}",
+        f"last_updated: {today}",
         f"doc_type: {doc_type}",
         f"full_text: sources/{doc_name}.{ext}",
     ]
@@ -369,13 +409,63 @@ _SAFE_NAME_RE = re.compile(r'[^\w\-]')
 
 
 def _sanitize_concept_name(name: str) -> str:
-    """Sanitize a concept name for safe use as a filename."""
+    """Sanitize a concept name for safe use as a filename.
+
+    Replaces non-word chars with hyphens, collapses consecutive hyphens,
+    strips leading/trailing hyphens, and truncates to 60 chars.
+    """
     name = unicodedata.normalize("NFKC", name)
     sanitized = _SAFE_NAME_RE.sub("-", name).strip("-")
+    sanitized = re.sub(r"-{2,}", "-", sanitized)
+    if len(sanitized) > 60:
+        sanitized = sanitized[:60].rsplit("-", 1)[0]
     return sanitized or "unnamed-concept"
 
 
-def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is_update: bool, brief: str = "", citations: list | None = None) -> None:
+def _normalize_content(value) -> str:
+    """Normalize LLM output that may be a list instead of string."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "\n".join(str(v) for v in value)
+    return str(value)
+
+
+def _format_callout(callout_type: str, title: str, content: str) -> str:
+    """Format content as an Obsidian collapsible callout block."""
+    if isinstance(content, list):
+        content = _normalize_content(content)
+    lines = content.strip().split("\n")
+    quoted = "\n".join(f"> {line}" for line in lines)
+    return f"> [!{callout_type}]- {title}\n{quoted}"
+
+
+def _format_deep_study(ds: dict) -> str:
+    """Format a deep_study dict into Obsidian callout blocks."""
+    if not ds:
+        return ""
+    sections = []
+    eli5 = _normalize_content(ds.get("eli5", ""))
+    if eli5.strip():
+        sections.append(_format_callout("tip", "ELI5", eli5))
+    analogy = _normalize_content(ds.get("analogy", ""))
+    if analogy.strip():
+        sections.append(_format_callout("tip", "Real-World Analogy", analogy))
+    misconceptions = _normalize_content(ds.get("misconceptions", ""))
+    if misconceptions.strip():
+        sections.append(_format_callout("warning", "Common Misconceptions", misconceptions))
+    questions = _normalize_content(ds.get("questions", ""))
+    if questions.strip():
+        sections.append(_format_callout("question", "Check Your Understanding", questions))
+    why = _normalize_content(ds.get("why_it_matters", ""))
+    if why.strip():
+        sections.append(_format_callout("info", "Why It Matters", why))
+    if not sections:
+        return ""
+    return "<!-- openkb-deep-study-start -->\n" + "\n\n".join(sections) + "\n<!-- openkb-deep-study-end -->"
+
+
+def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is_update: bool, brief: str = "", citations: list | None = None, tags: list | None = None, deep_study: dict | None = None) -> None:
     """Write or update a concept page, managing the sources frontmatter."""
     concepts_dir = wiki_dir / "concepts"
     concepts_dir.mkdir(parents=True, exist_ok=True)
@@ -428,20 +518,59 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
         # Update citations in frontmatter
         if citations and existing.startswith("---"):
             existing = _update_frontmatter_field(existing, path, "citations", json.dumps(citations, ensure_ascii=False))
-            return
+        # Update tags in frontmatter
+        if tags and existing.startswith("---"):
+            existing = _update_frontmatter_field(existing, path, "tags", json.dumps(tags, ensure_ascii=False))
+        # Refresh last_updated
+        if existing.startswith("---"):
+            existing = _update_frontmatter_field(existing, path, "last_updated", date.today().isoformat())
+        # Append deep study callouts
+        if deep_study:
+            callouts = _format_deep_study(deep_study)
+            if callouts:
+                start_marker = "<!-- openkb-deep-study-start -->"
+                end_marker = "<!-- openkb-deep-study-end -->"
+                if start_marker in existing:
+                    start_pos = existing.find(start_marker)
+                    end_pos = existing.find(end_marker)
+                    if end_pos != -1:
+                        existing = existing[:start_pos].rstrip() + "\n\n" + callouts
+                    else:
+                        existing = existing[:start_pos].rstrip() + "\n\n" + callouts
+                else:
+                    existing = existing.rstrip() + "\n\n" + callouts
         path.write_text(existing, encoding="utf-8")
     else:
         if content.startswith("---"):
             end = content.find("---", 3)
             if end != -1:
                 content = content[end + 3:].lstrip("\n")
-        fm_lines = [f"sources: [{source_file}]"]
+        today = date.today().isoformat()
+        fm_lines = [
+            f"type: concept",
+            f"title: \"{name}\"",
+            f"date: {today}",
+            f"last_updated: {today}",
+            f"sources: [{source_file}]",
+        ]
         if brief:
             fm_lines.append(f"brief: {brief}")
         if citations:
             fm_lines.append(f"citations: {json.dumps(citations, ensure_ascii=False)}")
+        if tags:
+            fm_lines.append(f"tags: {json.dumps(tags, ensure_ascii=False)}")
+        fm_lines.extend([
+            "understanding_level: unreviewed",
+            "last_reviewed: null",
+            "review_count: 0",
+        ])
         frontmatter = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
-        path.write_text(frontmatter + content, encoding="utf-8")
+        page_text = frontmatter + content
+        if deep_study:
+            callouts = _format_deep_study(deep_study)
+            if callouts:
+                page_text += "\n\n" + callouts
+        path.write_text(page_text, encoding="utf-8")
 
 
 def _update_frontmatter_field(text: str, path: Path, field: str, value: str) -> str:
@@ -454,7 +583,7 @@ def _update_frontmatter_field(text: str, path: Path, field: str, value: str) -> 
     fm = text[:end + 3]
     body = text[end + 3:]
     if f"{field}:" in fm:
-        fm = re.sub(rf'{field}:.*', f'{field}: {value}', fm)
+        fm = re.sub(rf'^{field}:.*', f'{field}: {value}', fm, flags=re.MULTILINE)
     else:
         fm = fm.replace("---\n", f"---\n{field}: {value}\n", 1)
     result = fm + body
@@ -600,6 +729,47 @@ def _update_index(
 DEFAULT_COMPILE_CONCURRENCY = 5
 
 
+def generate_deep_study_for_concept(
+    concept_path: Path,
+    model: str,
+    wiki_dir: Path,
+) -> bool:
+    """Generate deep study content for a single concept page (upgrade use case).
+
+    Returns True if deep study was generated, False if skipped or failed.
+    """
+    text = concept_path.read_text(encoding="utf-8")
+
+    if "<!-- openkb-deep-study-start -->" in text:
+        return False
+
+    body = text
+    if text.startswith("---"):
+        end = text.find("---", 3)
+        if end != -1:
+            body = text[end + 3:].strip()
+
+    schema_md = get_agents_md(wiki_dir)
+    system_msg = {"role": "system", "content": f"Generate active learning content.\n\n{schema_md}"}
+    user_msg = {"role": "user", "content": f"Concept page content:\n\n{body}\n\n{_DEEP_STUDY_UPGRADE_PROMPT}"}
+
+    raw = _llm_call(model, [system_msg, user_msg], f"deep-study: {concept_path.stem}")
+    try:
+        parsed = _parse_json(raw)
+        deep_study = parsed.get("deep_study", {})
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Failed to parse deep study for %s", concept_path.name)
+        return False
+
+    callouts = _format_deep_study(deep_study)
+    if not callouts:
+        return False
+
+    updated = text.rstrip() + "\n\n" + callouts + "\n"
+    concept_path.write_text(updated, encoding="utf-8")
+    return True
+
+
 async def _compile_concepts(
     wiki_dir: Path,
     kb_dir: Path,
@@ -661,7 +831,7 @@ async def _compile_concepts(
     # --- Step 3: Generate/update concept pages concurrently (A cached) ---
     semaphore = asyncio.Semaphore(max_concurrency)
 
-    async def _gen_create(concept: dict) -> tuple[str, str, bool, str, list]:
+    async def _gen_create(concept: dict) -> tuple[str, str, bool, str, list, dict]:
         name = concept["name"]
         title = concept.get("title", name)
         async with semaphore:
@@ -680,11 +850,13 @@ async def _compile_concepts(
             brief = parsed.get("brief", "")
             content = parsed.get("content", raw)
             citations = parsed.get("citations", []) if isinstance(parsed, dict) else []
+            tags = parsed.get("tags", []) if isinstance(parsed, dict) else []
+            ds = parsed.get("deep_study", {}) if isinstance(parsed, dict) else {}
         except (json.JSONDecodeError, ValueError):
-            brief, content, citations = "", raw, []
-        return name, content, False, brief, citations
+            brief, content, citations, tags, ds = "", raw, [], [], {}
+        return name, content, False, brief, citations, tags, ds
 
-    async def _gen_update(concept: dict) -> tuple[str, str, bool, str, list]:
+    async def _gen_update(concept: dict) -> tuple[str, str, bool, str, list, dict]:
         name = concept["name"]
         title = concept.get("title", name)
         concept_path = wiki_dir / "concepts" / f"{_sanitize_concept_name(name)}.md"
@@ -712,9 +884,11 @@ async def _compile_concepts(
             brief = parsed.get("brief", "")
             content = parsed.get("content", raw)
             citations = parsed.get("citations", []) if isinstance(parsed, dict) else []
+            tags = parsed.get("tags", []) if isinstance(parsed, dict) else []
+            ds = parsed.get("deep_study", {}) if isinstance(parsed, dict) else {}
         except (json.JSONDecodeError, ValueError):
-            brief, content, citations = "", raw, []
-        return name, content, True, brief, citations
+            brief, content, citations, tags, ds = "", raw, [], [], {}
+        return name, content, True, brief, citations, tags, ds
 
     tasks = []
     tasks.extend(_gen_create(c) for c in create_items)
@@ -734,8 +908,8 @@ async def _compile_concepts(
             if isinstance(r, Exception):
                 logger.warning("Concept generation failed: %s", r)
                 continue
-            name, page_content, is_update, brief, citations = r
-            _write_concept(wiki_dir, name, page_content, source_file, is_update, brief=brief, citations=citations)
+            name, page_content, is_update, brief, citations, tags, deep_study = r
+            _write_concept(wiki_dir, name, page_content, source_file, is_update, brief=brief, citations=citations, tags=tags, deep_study=deep_study)
             safe_name = _sanitize_concept_name(name)
             concept_names.append(safe_name)
             if brief:
